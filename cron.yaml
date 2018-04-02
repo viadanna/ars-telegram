@@ -1,0 +1,4 @@
+cron:
+- description: "refresh"
+  url: /refresh
+  schedule: every 5 minutes
