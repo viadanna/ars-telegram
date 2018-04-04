@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/datastore"
+	"google.golang.org/appengine/log"
 	"google.golang.org/appengine/urlfetch"
 
 	"github.com/mmcdole/gofeed"
@@ -26,71 +27,98 @@ type Latest struct {
 	Latest int64
 }
 
-// Items is my own array struct for sorting
-type Items []*gofeed.Item
+// SortableItems is my own array struct for sorting
+type SortableItems []*gofeed.Item
 
-// Items sort interface
-func (it Items) Len() int {
+// SortableItems sort interface
+func (it SortableItems) Len() int {
 	return len(it)
 }
 
-// Items sort interface
-func (it Items) Swap(i, j int) {
+// SortableItems sort interface
+func (it SortableItems) Swap(i, j int) {
 	it[i], it[j] = it[j], it[i]
 }
 
-// Items sort interface
-func (it Items) Less(i, j int) bool {
+// SortableItems sort interface
+func (it SortableItems) Less(i, j int) bool {
 	return it[i].PublishedParsed.Unix()-it[j].PublishedParsed.Unix() < 0
 }
 
-// Check ArsTechnica feed
-func refreshHandler(w http.ResponseWriter, r *http.Request) {
+// ArsTechnica new article generator
+func fetchArticles(ctx context.Context, latest int64, ch chan *gofeed.Item) {
 	// Fetch feed
-	ctx := appengine.NewContext(r)
 	fp := gofeed.NewParser()
 	client := urlfetch.Client(ctx)
 	resp, err := client.Get(FEED)
 	if err != nil {
-		log(w, err.Error())
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 
 	// Parse feed
 	feed, err := fp.Parse(resp.Body)
 	if err != nil {
-		log(w, err.Error())
+		log.Errorf(ctx, "%v", err)
 		return
 	}
 
+	// Use sorting interface
+	items := SortableItems(feed.Items)
+	sort.Sort(items)
+
+	// Yield new articles
+	for _, item := range feed.Items {
+		if item.PublishedParsed.Unix()-latest > 0 {
+			ch <- item
+		}
+	}
+
+	// Finish
+	close(ch)
+}
+
+// Check ArsTechnica feed
+func refreshHandler(w http.ResponseWriter, r *http.Request) {
+	// Create context
+	ctx := appengine.NewContext(r)
+
 	// Get unix timestamp for last article sent
 	key := datastore.NewKey(ctx, "Latest", "latest", 0, nil)
-	var latest Latest
+	latest := Latest{Latest: 0}
 	datastore.Get(ctx, key, &latest)
 
-	// Filter new items
-	items := make(Items, 0)
-	for _, item := range feed.Items {
-		if item.PublishedParsed.Unix()-latest.Latest > 0 {
-			items = append(items, item)
+	// Fetch new articles using generator
+	ch := make(chan *gofeed.Item)
+	go fetchArticles(ctx, latest.Latest, ch)
+
+	// Control channel for sending messages async
+	resultChannel := make(chan bool)
+	sending := 0
+
+	for item := range ch {
+		// Send new article to Telegram bot
+		msg := fmt.Sprintf("%s\n%s\n%s", item.Title, item.Published, item.Link)
+		go sendMessage(ctx, msg, resultChannel)
+		sending++
+
+		// Store latest
+		if item.PublishedParsed.Unix() > latest.Latest {
+			latest = Latest{Latest: item.PublishedParsed.Unix()}
 		}
 	}
 
-	// Send new items to Telegram bot
-	if len(items) > 0 {
-		sort.Sort(items)
-		for _, item := range items {
-			// Store latest
-			latest = Latest{Latest: item.PublishedParsed.Unix()}
-			if _, err := datastore.Put(ctx, key, &latest); err != nil {
-				log(w, err.Error())
-				return
-			}
-			msg := fmt.Sprintf("%s\n%s\n%s", item.Title, item.Published, item.Link)
-			sendMessage(ctx, msg)
-		}
+	// Store last timestamp
+	if _, err := datastore.Put(ctx, key, &latest); err != nil {
+		response(w, err.Error())
+		return
 	}
-	log(w, "OK")
+
+	// Wait all messages sent
+	for i := sending; i > 0; i-- {
+		<-resultChannel
+	}
+	response(w, "OK")
 }
 
 // Start app
@@ -100,16 +128,16 @@ func main() {
 }
 
 // Send Telegram message
-func sendMessage(ctx context.Context, msg string) bool {
+func sendMessage(ctx context.Context, msg string, ch chan bool) {
 	json := []byte(`{"chat_id":"` + CHAT + `", "text":"` + msg + `"}`)
 	body := bytes.NewBuffer(json)
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TOKEN)
 	client := urlfetch.Client(ctx)
 	_, err := client.Post(url, "application/json", body)
-	return err == nil
+	ch <- err == nil
 }
 
 // Helper logging to response
-func log(w http.ResponseWriter, val interface{}) {
+func response(w http.ResponseWriter, val interface{}) {
 	w.Write([]byte(fmt.Sprintf("%v\n\n", val)))
 }
